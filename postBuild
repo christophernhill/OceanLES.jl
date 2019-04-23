@@ -1,0 +1,2 @@
+/bin/rm /srv/conda/bin/jupyter-notebook
+/bin/ln -s /srv/conda/bin/jupyter-lab /srv/conda/bin/jupyter-notebook
