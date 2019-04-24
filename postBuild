@@ -5,5 +5,7 @@ jupyter labextension install @jupyterlab/git
 pip install jupyterlab-git
 jupyter serverextension enable --py jupyterlab_git
 
+jupyter labextension install @jupyterlab/github
+
 jupyter labextension install @jupyterlab/plotly-extension
 jupyter labextension install jupyterlab_bokeh
