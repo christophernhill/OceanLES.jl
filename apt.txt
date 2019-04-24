@@ -3,3 +3,7 @@ octave-symbolic
 octave-miscellaneous
 gnuplot
 ghostscript
+gfortran
+mpich
+cmake
+libmpich-dev
