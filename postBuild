@@ -1,2 +1,6 @@
 /bin/rm /srv/conda/bin/jupyter-notebook
 /bin/ln -s /srv/conda/bin/jupyter-lab /srv/conda/bin/jupyter-notebook
+
+jupyter labextension install @jupyterlab/git
+pip install jupyterlab-git
+jupyter serverextension enable --py jupyterlab_git
