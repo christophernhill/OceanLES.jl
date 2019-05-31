@@ -13,28 +13,6 @@ struct CellField{A<:AbstractArray, G<:Grid} <: Field
     grid::G
 end
 
-function CellField(::CPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = zeros(T, size(g))
-    CellField{typeof(data), typeof(g)}(data, g)
-end
-
-function CellField(::GPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = CuArray{T}(undef, g.Nx, g.Ny, g.Nz)
-    data .= 0.0
-    CellField{typeof(data), typeof(g)}(data, g)
-end
-
-function CellField(T, ::CPU, g::RegularCartesianGrid)
-    data = zeros(T, size(g))
-    CellField{typeof(data), typeof(g)}(data, g)
-end
-
-function CellField(T, ::GPU, g::RegularCartesianGrid)
-    data = CuArray{T}(undef, g.Nx, g.Ny, g.Nz)
-    data .= 0.0
-    CellField{typeof(data), typeof(g)}(data, g)
-end
-
 """
     FaceFieldX{A<:AbstractArray, G<:Grid} <: FaceField
 
@@ -43,17 +21,6 @@ An x-face-centered field defined on a grid `G` whose values are stored in an `A`
 struct FaceFieldX{A<:AbstractArray, G<:Grid} <: FaceField
     data::A
     grid::G
-end
-
-function FaceFieldX(::CPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = zeros(T, size(g))
-    FaceFieldX{typeof(data), typeof(g)}(data, g)
-end
-
-function FaceFieldX(::GPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = CuArray{T}(undef, g.Nx, g.Ny, g.Nz)
-    data .= 0.0
-    FaceFieldX{typeof(data), typeof(g)}(data, g)
 end
 
 """
@@ -66,19 +33,8 @@ struct FaceFieldY{A<:AbstractArray, G<:Grid} <: FaceField
     grid::G
 end
 
-function FaceFieldY(::CPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = zeros(T, size(g))
-    FaceFieldY{typeof(data), typeof(g)}(data, g)
-end
-
-function FaceFieldY(::GPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = CuArray{T}(undef, g.Nx, g.Ny, g.Nz)
-    data .= 0.0
-    FaceFieldY{typeof(data), typeof(g)}(data, g)
-end
-
 """
-    FaceFieldZ{T, G<:Grid{T}} <: FaceField{G}
+    FaceFieldZ{A<:AbstractArray, G<:Grid} <: Field
 
 A z-face-centered field defined on a grid `G` whose values are stored in an `A`.
 """
@@ -87,19 +43,8 @@ struct FaceFieldZ{A<:AbstractArray, G<:Grid} <: FaceField
     grid::G
 end
 
-function FaceFieldZ(::CPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = zeros(T, size(g))
-    FaceFieldZ{typeof(data), typeof(g)}(data, g)
-end
-
-function FaceFieldZ(::GPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = CuArray{T}(undef, g.Nx, g.Ny, g.Nz)
-    data .= 0.0
-    FaceFieldZ{typeof(data), typeof(g)}(data, g)
-end
-
 """
-    EdgeField{T<:AbstractArray} <: Field
+    EdgeField{A<:AbstractArray, G<:Grid} <: Field
 
 An edge-centered field defined on a grid `G` whose values are stored in an `A`.
 """
@@ -108,46 +53,70 @@ struct EdgeField{A<:AbstractArray, G<:Grid} <: Field
     grid::G
 end
 
-function EdgeField(::CPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = zeros(T, size(g))
-    EdgeField{typeof(data), typeof(g)}(data, g)
-end
+# Constructors
 
-function EdgeField(::GPU, g::RegularCartesianGrid{T, <:AbstractRange}) where T <: AbstractFloat
-    data = CuArray{T}(undef, g.Nx, g.Ny, g.Nz)
-    data .= 0.0
-    EdgeField{typeof(data), typeof(g)}(data, g)
-end
+"""
+    CellField([T=eltype(grid)], arch, grid)
+
+Return a `CellField` with element type `T` on `arch` and `grid`.
+`T` defaults to the element type of `grid`.
+"""
+CellField(T, arch, grid) = CellField(zeros(T, arch, grid), grid)
+
+"""
+    FaceFieldX([T=eltype(grid)], arch, grid)
+
+Return a `FaceFieldX` with element type `T` on `arch` and `grid`.
+`T` defaults to the element type of `grid`.
+"""
+FaceFieldX(T, arch, grid) = FaceFieldX(zeros(T, arch, grid), grid)
+
+"""
+    FaceFieldY([T=eltype(grid)], arch, grid)
+
+Return a `FaceFieldY` with element type `T` on `arch` and `grid`.
+`T` defaults to the element type of `grid`.
+"""
+FaceFieldY(T, arch, grid) = FaceFieldY(zeros(T, arch, grid), grid)
+
+"""
+    FaceFieldZ([T=eltype(grid)], arch, grid)
+
+Return a `FaceFieldZ` with element type `T` on `arch` and `grid`.
+`T` defaults to the element type of `grid`.
+"""
+FaceFieldZ(T, arch, grid) = FaceFieldZ(zeros(T, arch, grid), grid)
+
+"""
+    EdgeField([T=eltype(grid)], arch, grid)
+
+Return an `EdgeField` with element type `T` on `arch` and `grid`.
+`T` defaults to the element type of `grid`.
+"""
+ EdgeField(T, arch, grid) =  EdgeField(zeros(T, arch, grid), grid)
+
+ CellField(arch, grid) =  CellField(zeros(arch, grid), grid)
+FaceFieldX(arch, grid) = FaceFieldX(zeros(arch, grid), grid)
+FaceFieldY(arch, grid) = FaceFieldY(zeros(arch, grid), grid)
+FaceFieldZ(arch, grid) = FaceFieldZ(zeros(arch, grid), grid)
+ EdgeField(arch, grid) =  EdgeField(zeros(arch, grid), grid)
 
 @inline size(f::Field) = size(f.grid)
 @inline length(f::Field) = length(f.data)
 
 @inline getindex(f::Field, inds...) = getindex(f.data, inds...)
-# @inline getindex(f::Field, inds...) = f.data[inds...]
-
 @inline lastindex(f::Field) = lastindex(f.data)
 @inline lastindex(f::Field, dim) = lastindex(f.data, dim)
-
 @inline setindex!(f::Field, v, inds...) = setindex!(f.data, v, inds...)
-# @inline function setindex!(f::Field, v, inds...)
-#     f.data[inds...] = v
-# end
+
+@inline data(f::Field) = view(f.data, 1:f.grid.Nx, 1:f.grid.Ny, 1:f.grid.Nz)
 
 show(io::IO, f::Field) = show(io, f.data)
 
 iterate(f::Field, state=1) = iterate(f.data, state)
-# iterate(f::Field, state=1) = state > length(f) ? nothing : (f.data[state], state+1)
-
-similar(f::CellField{T})  where {T} = CellField(f.metadata, f.grid, f.metadata.float_type)
-similar(f::FaceFieldX{T}) where {T} = FaceFieldX(f.metadata, f.grid, f.metadata.float_type)
-similar(f::FaceFieldY{T}) where {T} = FaceFieldY(f.metadata, f.grid, f.metadata.float_type)
-similar(f::FaceFieldZ{T}) where {T} = FaceFieldZ(f.metadata, f.grid, f.metadata.float_type)
-similar(f::EdgeField{T})  where {T} = EdgeField(f.metadata, f.grid, f.metadata.float_type)
 
 set!(u::Field, v) = u.data .= convert(eltype(u.grid), v)
 set!(u::Field, v::Field) = @. u.data = v.data
-
-# set!(u::Field{G}, f::Function) where {G<:RegularCartesianGrid} = @. u.data = f(u.grid.xCA, u.grid.yCA, u.grid.zCA)
 
 # Define +, -, and * on fields as element-wise calculations on their data. This
 # is only true for fields of the same type, e.g. when adding a FaceFieldY to

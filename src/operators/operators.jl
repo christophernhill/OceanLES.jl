@@ -22,7 +22,6 @@ export
     avgz_c2f,
     avgz_f2c,
     avgz_f2e,
-    avg_xy,
     div_f2c,
     div_c2f,
     δx_f2c_ab̄ˣ,
@@ -41,6 +40,8 @@ export
     δy_e2f_v̄ᶻw̄ʸ,
     δz_c2f_w̄ᶻw̄ᶻ,
     u∇w,
+    fv,
+    fu,
     δx²_c2f2c,
     δy²_c2f2c,
     δz²_c2f2c,
@@ -54,7 +55,8 @@ export
     𝜈∇²u,
     𝜈∇²v,
     𝜈∇²w,
-    ∇²_ppn
+    ∇²_ppn,
+    ∇h_u
 
 include("ops_regular_cartesian_grid.jl")
 

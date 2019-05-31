@@ -32,6 +32,7 @@ export
     FaceFieldY,
     FaceFieldZ,
     EdgeField,
+    data,
     set!,
 
     # FieldSets (collections of related fields)
@@ -55,6 +56,9 @@ export
     Default,
     Flux,
     Gradient,
+    Value,
+    getbc,
+    setbc!,
 
     # Time stepping
     time_step!,
@@ -89,15 +93,20 @@ export
     run_diagnostic,
     FieldSummary,
     NaNChecker,
+    VelocityDivergenceChecker,
     Nusselt_wT,
     Nusselt_Chi,
 
     # Package utilities
-    prettytime
+    prettytime,
+
+    # Turbulence closures
+    TurbulenceClosures
 
 # Standard library modules
 using
     Statistics,
+    LinearAlgebra,
     Printf
 
 # Third-party modules
@@ -105,11 +114,17 @@ using
     FFTW,
     JLD,
     NetCDF,
-    StaticArrays
+    StaticArrays,
+    OffsetArrays
 
 import
+    Adapt,
     GPUifyLoops
 
+# Adapt an offset CuArray to work nicely with CUDA kernels.
+Adapt.adapt_structure(to, x::OffsetArray) = OffsetArray(Adapt.adapt(to, parent(x)), x.offsets)
+
+# Import CUDA utilities if cuda is detected.
 const HAVE_CUDA = try
     using CUDAdrv, CUDAnative, CuArrays
     true
@@ -140,13 +155,15 @@ end
 abstract type Metadata end
 abstract type ConstantsCollection end
 abstract type EquationOfState end
-abstract type Grid end
+abstract type Grid{T} end
 abstract type Field end
 abstract type FaceField <: Field end
 abstract type FieldSet end
 abstract type OutputWriter end
 abstract type Diagnostic end
-abstract type AbstractPoissonSolver end
+abstract type PoissonSolver end
+
+include("utils.jl")
 
 include("model_configuration.jl")
 include("clock.jl")
@@ -157,6 +174,7 @@ include("fieldsets.jl")
 include("forcing.jl")
 
 include("operators/operators.jl")
+include("closures/turbulence_closures.jl")
 
 include("boundary_conditions.jl")
 include("equation_of_state.jl")
@@ -166,7 +184,5 @@ include("time_steppers.jl")
 
 include("output_writers.jl")
 include("diagnostics.jl")
-
-include("utils.jl")
 
 end # module

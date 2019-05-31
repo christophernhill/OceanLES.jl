@@ -33,23 +33,24 @@ function time_step!(model::Model{A}, Nt, Δt) where A <: Architecture
     Lx, Ly, Lz = model.grid.Lx, model.grid.Ly, model.grid.Lz
     Δx, Δy, Δz = model.grid.Δx, model.grid.Δy, model.grid.Δz
 
-    grid = model.grid
-    cfg = model.configuration
-    bcs = model.boundary_conditions
-    clock = model.clock
-
-    G = model.G
-    Gp = model.Gp
+    # Unpack model fields
+         grid = model.grid
+        clock = model.clock
+          eos = model.eos
     constants = model.constants
-    eos =  model.eos
-    U = model.velocities
-    tr = model.tracers
-    pr = model.pressures
-    forcing = model.forcing
+            U = model.velocities
+           tr = model.tracers
+           pr = model.pressures
+      forcing = model.forcing
+      closure = model.closure
     poisson_solver = model.poisson_solver
 
-    RHS = model.stepper_tmp.fCC1
-    ϕ = model.stepper_tmp.fCC2
+    bcs = model.boundary_conditions
+    G = model.G
+    Gp = model.Gp
+
+    # We can use the same array for the right-hand-side RHS and the solution ϕ.
+    RHS, ϕ = poisson_solver.storage, poisson_solver.storage
 
     gΔz = model.constants.g * model.grid.Δz
     fCor = model.constants.f
@@ -65,26 +66,20 @@ function time_step!(model::Model{A}, Nt, Δt) where A <: Architecture
     Bx, By, Bz = floor(Int, Nx/Tx), floor(Int, Ny/Ty), Nz  # Blocks in grid
 
     tb = (threads=(Tx, Ty), blocks=(Bx, By, Bz))
+    FT = eltype(grid)
 
     for n in 1:Nt
-        χ = ifelse(model.clock.iteration == 0, -0.5, 0.125) # Adams-Bashforth (AB2) parameter.
+        χ = ifelse(model.clock.iteration == 0, FT(-0.5), FT(0.125)) # Adams-Bashforth (AB2) parameter.
 
-        @launch device(arch) store_previous_source_terms!(grid, Gⁿ..., G⁻..., threads=(Tx, Ty), blocks=(Bx, By, Bz))
-        @launch device(arch) update_buoyancy!(grid, constants, eos, tr.T.data, pr.pHY′.data, threads=(Tx, Ty), blocks=(Bx, By))
-        @launch device(arch) calculate_interior_source_terms!(grid, constants, eos, cfg, uvw..., TS..., pr.pHY′.data, Gⁿ..., forcing, threads=(Tx, Ty), blocks=(Bx, By, Bz))
-                             calculate_boundary_source_terms!(model)
-        @launch device(arch) adams_bashforth_update_source_terms!(grid, Gⁿ..., G⁻..., χ, threads=(Tx, Ty), blocks=(Bx, By, Bz))
-        @launch device(arch) calculate_source_term_divergence!(arch, grid, Guvw..., RHS.data, threads=(Tx, Ty), blocks=(Bx, By, Bz))
-
-        if arch == CPU()
-            solve_poisson_3d_ppn_planned!(poisson_solver, grid, RHS, ϕ)
-            @. pr.pNHS.data = real(ϕ.data)
-        elseif arch == GPU()
-            solve_poisson_3d_ppn_gpu_planned!(Tx, Ty, Bx, By, Bz, poisson_solver, grid, RHS, ϕ)
-            @launch device(arch) idct_permute!(grid, ϕ.data, pr.pNHS.data, threads=(Tx, Ty), blocks=(Bx, By, Bz))
-        end
-
-        @launch device(arch) update_velocities_and_tracers!(grid, uvw..., TS..., pr.pNHS.data, Gⁿ..., G⁻..., Δt, threads=(Tx, Ty), blocks=(Bx, By, Bz))
+        @launch device(arch) threads=(Tx, Ty) blocks=(Bx, By, Bz) store_previous_source_terms!(grid, Gⁿ..., G⁻...)
+        @launch device(arch) threads=(Tx, Ty) blocks=(Bx, By)     update_buoyancy!(grid, constants, eos, tr.T.data, pr.pHY′.data)
+        @launch device(arch) threads=(Tx, Ty) blocks=(Bx, By, Bz) calculate_interior_source_terms!(grid, constants, eos, closure, uvw..., TS..., pr.pHY′.data, Gⁿ..., forcing)
+                                                                  calculate_boundary_source_terms!(model)
+        @launch device(arch) threads=(Tx, Ty) blocks=(Bx, By, Bz) adams_bashforth_update_source_terms!(grid, Gⁿ..., G⁻..., χ)
+        @launch device(arch) threads=(Tx, Ty) blocks=(Bx, By, Bz) calculate_poisson_right_hand_side!(arch, grid, Δt, uvw..., Guvw..., RHS)
+                                                                  solve_for_pressure!(arch, model)
+        @launch device(arch) threads=(Tx, Ty) blocks=(Bx, By, Bz) update_velocities_and_tracers!(grid, uvw..., TS..., pr.pNHS.data, Gⁿ..., G⁻..., Δt)
+        @launch device(arch) threads=(Tx, Ty) blocks=(Bx, By)     compute_w_from_continuity!(grid, uvw...)
 
         clock.time += Δt
         clock.iteration += 1
@@ -102,6 +97,25 @@ function time_step!(model::Model{A}, Nt, Δt) where A <: Architecture
 end
 
 time_step!(model; Nt, Δt) = time_step!(model, Nt, Δt)
+
+function solve_for_pressure!(::CPU, model::Model)
+    Nx, Ny, Nz = model.grid.Nx, model.grid.Ny, model.grid.Nz
+    RHS, ϕ = model.poisson_solver.storage, model.poisson_solver.storage
+
+    solve_poisson_3d_ppn_planned!(model.poisson_solver, model.grid)
+    data(model.pressures.pNHS) .= real.(ϕ)
+end
+
+function solve_for_pressure!(::GPU, model::Model)
+    Nx, Ny, Nz = model.grid.Nx, model.grid.Ny, model.grid.Nz
+    RHS, ϕ = model.poisson_solver.storage, model.poisson_solver.storage
+
+    Tx, Ty = 16, 16  # Not sure why I have to do this. Will be superseded soon.
+    Bx, By, Bz = floor(Int, Nx/Tx), floor(Int, Ny/Ty), Nz  # Blocks in grid
+
+    solve_poisson_3d_ppn_planned!(Tx, Ty, Bx, By, Bz, model.poisson_solver, model.grid)
+    @launch device(GPU()) threads=(Tx, Ty) blocks=(Bx, By, Bz) idct_permute!(model.grid, ϕ, model.pressures.pNHS.data)
+end
 
 """Store previous source terms before updating them."""
 function store_previous_source_terms!(grid::Grid, Gu, Gv, Gw, GT, GS, Gpu, Gpv, Gpw, GpT, GpS)
@@ -136,44 +150,44 @@ function update_buoyancy!(grid::Grid, constants, eos, T, pHY′)
 end
 
 "Store previous value of the source term and calculate current source term."
-function calculate_interior_source_terms!(grid::Grid, constants, eos, cfg, u, v, w, T, S, pHY′, Gu, Gv, Gw, GT, GS, F)
+function calculate_interior_source_terms!(grid::Grid, constants, eos, closure, u, v, w, T, S, pHY′, Gu, Gv, Gw, GT, GS, F)
     Nx, Ny, Nz = grid.Nx, grid.Ny, grid.Nz
     Δx, Δy, Δz = grid.Δx, grid.Δy, grid.Δz
 
+    grav = constants.g
     fCor = constants.f
     ρ₀ = eos.ρ₀
-    𝜈h, 𝜈v, κh, κv = cfg.𝜈h, cfg.𝜈v, cfg.κh, cfg.κv
 
     @loop for k in (1:grid.Nz; blockIdx().z)
         @loop for j in (1:grid.Ny; (blockIdx().y - 1) * blockDim().y + threadIdx().y)
             @loop for i in (1:grid.Nx; (blockIdx().x - 1) * blockDim().x + threadIdx().x)
                 # u-momentum equation
                 @inbounds Gu[i, j, k] = (-u∇u(grid, u, v, w, i, j, k)
-                                            + fCor*avg_xy(grid, v, i, j, k)
+                                            + fv(grid, v, fCor, i, j, k)
                                             - δx_c2f(grid, pHY′, i, j, k) / (Δx * ρ₀)
-                                            + 𝜈∇²u(grid, u, 𝜈h, 𝜈v, i, j, k)
+                                            + ∂ⱼ_2ν_Σ₁ⱼ(i, j, k, grid, closure, eos, grav, u, v, w, T, S)
                                             + F.u(grid, u, v, w, T, S, i, j, k))
 
                 # v-momentum equation
                 @inbounds Gv[i, j, k] = (-u∇v(grid, u, v, w, i, j, k)
-                                            - fCor*avg_xy(grid, u, i, j, k)
+                                            - fu(grid, u, fCor, i, j, k)
                                             - δy_c2f(grid, pHY′, i, j, k) / (Δy * ρ₀)
-                                            + 𝜈∇²v(grid, v, 𝜈h, 𝜈v, i, j, k)
+                                            + ∂ⱼ_2ν_Σ₂ⱼ(i, j, k, grid, closure, eos, grav, u, v, w, T, S)
                                             + F.v(grid, u, v, w, T, S, i, j, k))
 
                 # w-momentum equation: comment about how pressure and buoyancy are handled
                 @inbounds Gw[i, j, k] = (-u∇w(grid, u, v, w, i, j, k)
-                                            + 𝜈∇²w(grid, w, 𝜈h, 𝜈v, i, j, k)
+                                            + ∂ⱼ_2ν_Σ₃ⱼ(i, j, k, grid, closure, eos, grav, u, v, w, T, S)
                                             + F.w(grid, u, v, w, T, S, i, j, k))
 
                 # temperature equation
                 @inbounds GT[i, j, k] = (-div_flux(grid, u, v, w, T, i, j, k)
-                                            + κ∇²(grid, T, κh, κv, i, j, k)
+                                            + ∇_κ_∇ϕ(i, j, k, grid, T, closure, eos, grav, u, v, w, T, S)
                                             + F.T(grid, u, v, w, T, S, i, j, k))
 
                 # salinity equation
                 @inbounds GS[i, j, k] = (-div_flux(grid, u, v, w, S, i, j, k)
-                                            + κ∇²(grid, S, κh, κv, i, j, k)
+                                            + ∇_κ_∇ϕ(i, j, k, grid, S, closure, eos, grav, u, v, w, T, S)
                                             + F.S(grid, u, v, w, T, S, i, j, k))
             end
         end
@@ -182,15 +196,15 @@ function calculate_interior_source_terms!(grid::Grid, constants, eos, cfg, u, v,
     @synchronize
 end
 
-function adams_bashforth_update_source_terms!(grid::Grid, Gu, Gv, Gw, GT, GS, Gpu, Gpv, Gpw, GpT, GpS, χ)
+function adams_bashforth_update_source_terms!(grid::Grid{FT}, Gu, Gv, Gw, GT, GS, Gpu, Gpv, Gpw, GpT, GpS, χ) where FT
     @loop for k in (1:grid.Nz; blockIdx().z)
         @loop for j in (1:grid.Ny; (blockIdx().y - 1) * blockDim().y + threadIdx().y)
             @loop for i in (1:grid.Nx; (blockIdx().x - 1) * blockDim().x + threadIdx().x)
-                @inbounds Gu[i, j, k] = (1.5 + χ)*Gu[i, j, k] - (0.5 + χ)*Gpu[i, j, k]
-                @inbounds Gv[i, j, k] = (1.5 + χ)*Gv[i, j, k] - (0.5 + χ)*Gpv[i, j, k]
-                @inbounds Gw[i, j, k] = (1.5 + χ)*Gw[i, j, k] - (0.5 + χ)*Gpw[i, j, k]
-                @inbounds GT[i, j, k] = (1.5 + χ)*GT[i, j, k] - (0.5 + χ)*GpT[i, j, k]
-                @inbounds GS[i, j, k] = (1.5 + χ)*GS[i, j, k] - (0.5 + χ)*GpS[i, j, k]
+                @inbounds Gu[i, j, k] = (FT(1.5) + χ)*Gu[i, j, k] - (FT(0.5) + χ)*Gpu[i, j, k]
+                @inbounds Gv[i, j, k] = (FT(1.5) + χ)*Gv[i, j, k] - (FT(0.5) + χ)*Gpv[i, j, k]
+                @inbounds Gw[i, j, k] = (FT(1.5) + χ)*Gw[i, j, k] - (FT(0.5) + χ)*Gpw[i, j, k]
+                @inbounds GT[i, j, k] = (FT(1.5) + χ)*GT[i, j, k] - (FT(0.5) + χ)*GpT[i, j, k]
+                @inbounds GS[i, j, k] = (FT(1.5) + χ)*GS[i, j, k] - (FT(0.5) + χ)*GpS[i, j, k]
             end
         end
     end
@@ -198,12 +212,12 @@ function adams_bashforth_update_source_terms!(grid::Grid, Gu, Gv, Gw, GT, GS, Gp
 end
 
 "Store previous value of the source term and calculate current source term."
-function calculate_source_term_divergence!(::CPU, grid::Grid, Gu, Gv, Gw, RHS)
+function calculate_poisson_right_hand_side!(::CPU, grid::Grid, Δt, u, v, w, Gu, Gv, Gw, RHS)
     @loop for k in (1:grid.Nz; blockIdx().z)
         @loop for j in (1:grid.Ny; (blockIdx().y - 1) * blockDim().y + threadIdx().y)
             @loop for i in (1:grid.Nx; (blockIdx().x - 1) * blockDim().x + threadIdx().x)
                 # Calculate divergence of the RHS source terms (Gu, Gv, Gw).
-                @inbounds RHS[i, j, k] = div_f2c(grid, Gu, Gv, Gw, i, j, k)
+                @inbounds RHS[i, j, k] = div_f2c(grid, u, v, w, i, j, k) / Δt + div_f2c(grid, Gu, Gv, Gw, i, j, k)
             end
         end
     end
@@ -211,7 +225,7 @@ function calculate_source_term_divergence!(::CPU, grid::Grid, Gu, Gv, Gw, RHS)
     @synchronize
 end
 
-function calculate_source_term_divergence!(::GPU, grid::Grid, Gu, Gv, Gw, RHS)
+function calculate_poisson_right_hand_side!(::GPU, grid::Grid, Δt, u, v, w, Gu, Gv, Gw, RHS)
     Nx, Ny, Nz = grid.Nx, grid.Ny, grid.Nz
     @loop for k in (1:Nz; blockIdx().z)
         @loop for j in (1:Ny; (blockIdx().y - 1) * blockDim().y + threadIdx().y)
@@ -219,9 +233,9 @@ function calculate_source_term_divergence!(::GPU, grid::Grid, Gu, Gv, Gw, RHS)
                 # Calculate divergence of the RHS source terms (Gu, Gv, Gw) and applying a permutation
                 # which is the first step in the DCT.
                 if CUDAnative.ffs(k) == 1  # isodd(k)
-                    @inbounds RHS[i, j, convert(UInt32, CUDAnative.floor(k/2) + 1)] = div_f2c(grid, Gu, Gv, Gw, i, j, k)
+                    @inbounds RHS[i, j, convert(UInt32, CUDAnative.floor(k/2) + 1)] = div_f2c(grid, u, v, w, i, j, k) / Δt + div_f2c(grid, Gu, Gv, Gw, i, j, k)
                 else
-                    @inbounds RHS[i, j, convert(UInt32, Nz - CUDAnative.floor((k-1)/2))] = div_f2c(grid, Gu, Gv, Gw, i, j, k)
+                    @inbounds RHS[i, j, convert(UInt32, Nz - CUDAnative.floor((k-1)/2))] = div_f2c(grid, u, v, w, i, j, k) / Δt + div_f2c(grid, Gu, Gv, Gw, i, j, k)
                 end
             end
         end
@@ -254,7 +268,6 @@ function update_velocities_and_tracers!(grid::Grid, u, v, w, T, S, pNHS, Gu, Gv,
             @loop for i in (1:grid.Nx; (blockIdx().x - 1) * blockDim().x + threadIdx().x)
                 @inbounds u[i, j, k] = u[i, j, k] + (Gu[i, j, k] - (δx_c2f(grid, pNHS, i, j, k) / grid.Δx)) * Δt
                 @inbounds v[i, j, k] = v[i, j, k] + (Gv[i, j, k] - (δy_c2f(grid, pNHS, i, j, k) / grid.Δy)) * Δt
-                @inbounds w[i, j, k] = w[i, j, k] + (Gw[i, j, k] - (δz_c2f(grid, pNHS, i, j, k) / grid.Δz)) * Δt
                 @inbounds T[i, j, k] = T[i, j, k] + (GT[i, j, k] * Δt)
                 @inbounds S[i, j, k] = S[i, j, k] + (GS[i, j, k] * Δt)
             end
@@ -264,6 +277,19 @@ function update_velocities_and_tracers!(grid::Grid, u, v, w, T, S, pNHS, Gu, Gv,
     @synchronize
 end
 
+"Compute the vertical velocity w from the continuity equation."
+function compute_w_from_continuity!(grid::Grid, u, v, w)
+    @loop for j in (1:grid.Ny; (blockIdx().y - 1) * blockDim().y + threadIdx().y)
+        @loop for i in (1:grid.Nx; (blockIdx().x - 1) * blockDim().x + threadIdx().x)
+            @inbounds w[i, j, 1] = 0
+            @unroll for k in 2:grid.Nz
+                @inbounds w[i, j, k] = w[i, j, k-1] + grid.Δz * ∇h_u(i, j, k-1, grid, u, v)
+            end
+        end
+    end
+
+    @synchronize
+end
 
 #
 # Boundary condition physics specification
@@ -280,12 +306,13 @@ function calculate_boundary_source_terms!(model::Model{A}) where A <: Architectu
     grid = model.grid
     clock = model.clock
     eos =  model.eos
-    cfg = model.configuration
+    closure = model.closure
     bcs = model.boundary_conditions
     U = model.velocities
     tr = model.tracers
     G = model.G
 
+    grav = model.constants.g
     t, iteration = clock.time, clock.iteration
     u, v, w, T, S = U.u.data, U.v.data, U.w.data, tr.T.data, tr.S.data
     Gu, Gv, Gw, GT, GS = G.Gu.data, G.Gv.data, G.Gw.data, G.GT.data, G.GS.data
@@ -293,8 +320,6 @@ function calculate_boundary_source_terms!(model::Model{A}) where A <: Architectu
     Bx, By, Bz = floor(Int, Nx/Tx), floor(Int, Ny/Ty), Nz  # Blocks in grid
 
     coord = :z #for coord in (:x, :y, :z) when we are ready to support more coordinates.
-    𝜈 = cfg.𝜈v
-    κ = cfg.κv
 
     u_x_bcs = getproperty(bcs.u, coord)
     v_x_bcs = getproperty(bcs.v, coord)
@@ -302,39 +327,65 @@ function calculate_boundary_source_terms!(model::Model{A}) where A <: Architectu
     T_x_bcs = getproperty(bcs.T, coord)
     S_x_bcs = getproperty(bcs.S, coord)
 
-    # Apply boundary conditions. We assume there is one molecular 'diffusivity'
-    # value, which is passed to apply_bcs.
-    apply_bcs!(arch, Val(coord), Bx, By, Bz, u_x_bcs.left, u_x_bcs.right, u, Gu, 𝜈, u, v, w, T, S, t, iteration, grid)
-    apply_bcs!(arch, Val(coord), Bx, By, Bz, v_x_bcs.left, v_x_bcs.right, v, Gv, 𝜈, u, v, w, T, S, t, iteration, grid)
-    apply_bcs!(arch, Val(coord), Bx, By, Bz, w_x_bcs.left, w_x_bcs.right, w, Gw, 𝜈, u, v, w, T, S, t, iteration, grid)
-    apply_bcs!(arch, Val(coord), Bx, By, Bz, T_x_bcs.left, T_x_bcs.right, T, GT, κ, u, v, w, T, S, t, iteration, grid)
-    apply_bcs!(arch, Val(coord), Bx, By, Bz, S_x_bcs.left, S_x_bcs.right, S, GS, κ, u, v, w, T, S, t, iteration, grid)
+    # Apply boundary conditions in the vertical direction.
+
+    # *Note*: for vertical boundaries in xz or yz, the transport coefficients should be evaluated at
+    # different locations than the ones speciifc below, which are specific to boundaries in the xy-plane.
+
+    apply_bcs!(arch, Val(coord), Bx, By, Bz, u_x_bcs.left, u_x_bcs.right, grid, u, Gu, ν₃₃.ffc,
+        closure, eos, grav, t, iteration, u, v, w, T, S)
+
+    apply_bcs!(arch, Val(coord), Bx, By, Bz, v_x_bcs.left, v_x_bcs.right, grid, v, Gv, ν₃₃.fcf,
+        closure, eos, grav, t, iteration, u, v, w, T, S)
+
+    #apply_bcs!(arch, Val(coord), Bx, By, Bz, w_x_bcs.left, w_x_bcs.right, grid, w, Gw, ν₃₃.cff,
+    #    closure, eos, grav, t, iteration, u, v, w, T, S)
+
+    apply_bcs!(arch, Val(coord), Bx, By, Bz, T_x_bcs.left, T_x_bcs.right, grid, T, GT, κ₃₃.ccc,
+        closure, eos, grav, t, iteration, u, v, w, T, S)
+
+    apply_bcs!(arch, Val(coord), Bx, By, Bz, S_x_bcs.left, S_x_bcs.right, grid, S, GS, κ₃₃.ccc,
+        closure, eos, grav, t, iteration, u, v, w, T, S)
 
     return nothing
 end
 
 # Do nothing if both boundary conditions are default.
-apply_bcs!(::CPU, ::Val{:x}, Bx, By, Bz, left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
-apply_bcs!(::CPU, ::Val{:y}, Bx, By, Bz, left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
-apply_bcs!(::CPU, ::Val{:z}, Bx, By, Bz, left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
+apply_bcs!(::CPU, ::Val{:x}, Bx, By, Bz,
+    left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
+apply_bcs!(::CPU, ::Val{:y}, Bx, By, Bz,
+    left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
+apply_bcs!(::CPU, ::Val{:z}, Bx, By, Bz,
+    left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
 
-apply_bcs!(::GPU, ::Val{:x}, Bx, By, Bz, left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
-apply_bcs!(::GPU, ::Val{:y}, Bx, By, Bz, left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
-apply_bcs!(::GPU, ::Val{:z}, Bx, By, Bz, left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
+apply_bcs!(::GPU, ::Val{:x}, Bx, By, Bz,
+    left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
+apply_bcs!(::GPU, ::Val{:y}, Bx, By, Bz,
+    left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
+apply_bcs!(::GPU, ::Val{:z}, Bx, By, Bz,
+    left_bc::BC{<:Default, T}, right_bc::BC{<:Default, T}, args...) where {T} = nothing
 
 # First, dispatch on coordinate.
-apply_bcs!(arch, ::Val{:x}, Bx, By, Bz, args...) = @launch device(arch) apply_x_bcs!(args..., threads=(Tx, Ty), blocks=(Bx, By, Bz))
-apply_bcs!(arch, ::Val{:y}, Bx, By, Bz, args...) = @launch device(arch) apply_y_bcs!(args..., threads=(Tx, Ty), blocks=(Bx, By, Bz))
-apply_bcs!(arch, ::Val{:z}, Bx, By, Bz, args...) = @launch device(arch) apply_z_bcs!(args..., threads=(Tx, Ty), blocks=(Bx, By))
+apply_bcs!(arch, ::Val{:x}, Bx, By, Bz, args...) =
+    @launch device(arch) threads=(Tx, Ty) blocks=(By, Bz) apply_x_bcs!(args...)
+apply_bcs!(arch, ::Val{:y}, Bx, By, Bz, args...) =
+    @launch device(arch) threads=(Tx, Ty) blocks=(Bx, Bz) apply_y_bcs!(args...)
+apply_bcs!(arch, ::Val{:z}, Bx, By, Bz, args...) =
+    @launch device(arch) threads=(Tx, Ty) blocks=(Bx, By) apply_z_bcs!(args...)
 
 "Apply a top and/or bottom boundary condition to variable ϕ. Note that this kernel
 MUST be launched with blocks=(Bx, By). If launched with blocks=(Bx, By, Bz), the
 boundary condition will be applied Bz times!"
-function apply_z_bcs!(top_bc, bottom_bc, ϕ, Gϕ, κ, u, v, w, T, S, t, iteration, grid::RegularCartesianGrid)
+function apply_z_bcs!(top_bc, bottom_bc, grid, ϕ, Gϕ, κ, closure, eos, g, t, iteration, u, v, w, T, S)
     @loop for j in (1:grid.Ny; (blockIdx().y - 1) * blockDim().y + threadIdx().y)
         @loop for i in (1:grid.Nx; (blockIdx().x - 1) * blockDim().x + threadIdx().x)
-            apply_z_top_bc!(top_bc, ϕ, Gϕ, κ, t, grid, u, v, w, T, S, iteration, i, j)
-            apply_z_bottom_bc!(bottom_bc, ϕ, Gϕ, κ, t, grid, u, v, w, T, S, iteration, i, j)
+
+               κ_top = κ(i, j, 1,       grid, closure, eos, g, u, v, w, T, S)
+            κ_bottom = κ(i, j, grid.Nz, grid, closure, eos, g, u, v, w, T, S)
+
+               apply_z_top_bc!(top_bc,    i, j, grid, ϕ, Gϕ, κ_top,    t, iteration, u, v, w, T, S)
+            apply_z_bottom_bc!(bottom_bc, i, j, grid, ϕ, Gϕ, κ_bottom, t, iteration, u, v, w, T, S)
+
         end
     end
     @synchronize
